@@ -1,0 +1,321 @@
+From bd3e1e90ce054175f8f8594c15338cde0bbc75d7 Mon Sep 17 00:00:00 2001
+From: Lavender3533 <104026084+Lavender3533@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 22:45:46 +0800
+Subject: [PATCH] vulkan: faster PTQ1_0 mat-vec on RDNA1
+
+Rewrite the dedicated PTQ1_0 mat-vec kernel so a 32-lane team works on one
+block at a time with one packed byte per lane. Activation loads become
+coalesced and are reused across all rows of the workgroup; trits are decoded
+once per row pair (two rows packed into 16-bit halves) and reused across all
+columns of a small-batch mat-vec.
+
+Rows per workgroup default to 16 on RDNA1 (measured best on an RX 5700 XT),
+other architectures keep the previous default. GGML_VK_PTQ1_ROWS and
+GGML_VK_PTQ1_MIN_ROWS override.
+
+RX 5700 XT, test-backend-ops perf, PTQ1_0 x f32:
+  m=17408 k=5120 n=1: 266 us -> 168 us
+  m=17408 k=5120 n=8: 2117 us -> 901 us
+test-backend-ops MUL_MAT ptq1_0: 168/168 passed.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          |  29 ++-
+ .../vulkan-shaders/mul_mat_vec_ptq1_0.comp    | 190 +++++++-----------
+ 2 files changed, 99 insertions(+), 120 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 108edfe..c5c7664 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -2917,6 +2917,31 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     static constexpr uint32_t mul_mat_vec_num_bindings = 5;
+     static constexpr uint32_t mul_mat_vec_id_num_bindings = 6;
+ 
++    // Rows per workgroup for the dedicated PTQ1_0 mat-vec. 16 was measured best on RDNA1 (RX 5700 XT);
++    // other architectures keep the previous default until measured. GGML_VK_PTQ1_ROWS overrides.
++    const uint32_t ptq1_rows = [&]() {
++        const char * s = getenv("GGML_VK_PTQ1_ROWS");
++        const int v = s ? atoi(s) : 0;
++        if (v > 0) {
++            return (uint32_t) v;
++        }
++        return device->architecture == AMD_RDNA1 ? 16u : 2 * rm_stdq;
++    }();
++    // Fewer rows as the column count grows, so the per-thread accumulators stay in registers.
++    const uint32_t ptq1_min_rows = [&]() {
++        const char * s = getenv("GGML_VK_PTQ1_MIN_ROWS");
++        const int v = s ? atoi(s) : 0;
++        return v > 0 ? (uint32_t) v : std::min(4u, ptq1_rows);
++    }();
++    auto const ptq1_rows_for = [&](uint32_t i) {
++        uint32_t c = i + 1, r = ptq1_rows;
++        while (c > 1 && r > ptq1_min_rows) {
++            r /= 2;
++            c = (c + 1) / 2;
++        }
++        return r;
++    };
++
+ #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
+ #define OCP_DMMV_LEN(NAME, REDUC)  (device->ocp_fp4 ? NAME ## _ocp_len[REDUC]  : NAME ## _len[REDUC])
+ #define OCP_DMMV_DATA(NAME, REDUC) (device->ocp_fp4 ? NAME ## _ocp_data[REDUC] : NAME ## _data[REDUC])
+@@ -2942,7 +2967,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f32_f32",  arr_dmmv_f16_f32_f32_len[reduc],  arr_dmmv_f16_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f32_f32", arr_dmmv_bf16_f32_f32_len[reduc], arr_dmmv_bf16_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f32_f32", arr_dmmv_q1_0_f32_f32_len[reduc], arr_dmmv_q1_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_PTQ1_0][i], "mul_mat_vec_ptq1_0_f32_f32", arr_dmmv_ptq1_0_f32_f32_len[reduc], arr_dmmv_ptq1_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_PTQ1_0][i], "mul_mat_vec_ptq1_0_f32_f32", arr_dmmv_ptq1_0_f32_f32_len[reduc], arr_dmmv_ptq1_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {ptq1_rows_for(i), 1, 1}, {wg_size_subgroup, ptq1_rows_for(i), i+1}, 1, true, use_subgroups, force_subgroup_size);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_PQ2_0][i], "mul_mat_vec_pq2_0_f32_f32", arr_dmmv_pq2_0_f32_f32_len[reduc], arr_dmmv_pq2_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_f32_f32", arr_dmmv_q2_0_f32_f32_len[reduc], arr_dmmv_q2_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_f32_f32", arr_dmmv_q4_0_f32_f32_len[reduc], arr_dmmv_q4_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+@@ -2973,7 +2998,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f16_f32",  arr_dmmv_f16_f16_f32_len[reduc],  arr_dmmv_f16_f16_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f16_f32", arr_dmmv_bf16_f16_f32_len[reduc], arr_dmmv_bf16_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f16_f32", arr_dmmv_q1_0_f16_f32_len[reduc], arr_dmmv_q1_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_PTQ1_0][i], "mul_mat_vec_ptq1_0_f16_f32", arr_dmmv_ptq1_0_f16_f32_len[reduc], arr_dmmv_ptq1_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_PTQ1_0][i], "mul_mat_vec_ptq1_0_f16_f32", arr_dmmv_ptq1_0_f16_f32_len[reduc], arr_dmmv_ptq1_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {ptq1_rows_for(i), 1, 1}, {wg_size_subgroup, ptq1_rows_for(i), i+1}, 1, true, use_subgroups, force_subgroup_size);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_PQ2_0][i], "mul_mat_vec_pq2_0_f16_f32", arr_dmmv_pq2_0_f16_f32_len[reduc], arr_dmmv_pq2_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_f16_f32", arr_dmmv_q2_0_f16_f32_len[reduc], arr_dmmv_q2_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_f16_f32", arr_dmmv_q4_0_f16_f32_len[reduc], arr_dmmv_q4_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_ptq1_0.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_ptq1_0.comp
+index 8516e51..20f48f6 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_ptq1_0.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_ptq1_0.comp
+@@ -5,84 +5,52 @@
+ 
+ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+-// Dedicated PTQ1_0 matrix-vector kernel.
+-//
+-// The generic mul_mat_vec path reaches PTQ1_0 through dequantize()/dequantize4(),
+-// which call ptq1_0_trit() once per weight: an 8-bit load plus a loop of up to
+-// four multiplies to skip the earlier trits in the same byte. Every packed byte
+-// is therefore re-read and re-decoded five times.
+-//
+-// This kernel reads each 28-byte block as seven 32-bit words and peels the five
+-// trits off a byte with the base-3 recurrence, two bytes at a time in 16-bit
+-// lanes (255*3 = 765 stays inside a lane, so lanes never interfere), which is
+-// 10 multiplies per 20 weights instead of ~60.
++// Dedicated PTQ1_0 matrix-vector kernel, byte-per-lane variant.
+ //
+ // Block layout (see ptq1_0.glsl / block_ptq1_0), 128 weights, 7 words:
+ //   words 0..3 : qs[0..15]  byte j, trit t -> element 16*t + j
+ //   words 4..5 : qs[16..23] byte j, trit t -> element 80 + 8*t + (j - 16)
+ //   word  6    : qh[0], qh[1] (4 trits each, element 120 + 2*t + h), d (f16)
+-// Weight = (trit - 1) * d, so sum_e w_e*y_e = d * (sum_e trit_e*y_e - sum_e y_e),
+-// and the second term is gathered once per work item as ysum.
++// Weight = (trit - 1) * d, so sum_e w_e*y_e = d * (sum_e trit_e*y_e - sum_e y_e).
+ //
+-// A work item is half a block (half 0 = words 0..2 plus the qh word, half 1 =
+-// words 3..5) so that rows of 5120 still spread over the workgroup. Activations
+-// are loaded once per item and reused across the NUM_ROWS rows.
++// A team of 32 lanes works on one block at a time; lane l owns packed byte l
++// (lanes 26..31 idle). For a fixed trit position the 16 qs[0..15] lanes touch 16
++// consecutive activations and the 8 qs[16..23] lanes touch 8 consecutive ones,
++// so activation loads are coalesced. A lane's five activations are loaded once
++// per block and reused for all NUM_ROWS rows, so register use does not grow with
++// the row count.
+ 
+ layout (binding = 0) readonly buffer A_U32 {uint data_a_u32[];};
+ 
+ FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+ 
+ #define PTQ1_0_WORDS 7u
+-#define LANE_MASK    0x00FF00FFu
+-#define TRIT_MASK    0x00030003u
+-
+-// Element offset (within the block) of byte 0 of main word k, for trit t.
+-uint word_base(const uint k, const uint t) {
+-    return k < 4u ? 4u*k + 16u*t : 80u + 4u*(k - 4u) + 8u*t;
+-}
+-
+-// One main word = 4 bytes x 5 trits = 20 weights. Consecutive bytes of a word map
+-// to consecutive elements for a fixed trit, so each trit step is one vec4 of
+-// activations.
+-void decode_word(const uint w, out vec4 q[5]) {
+-    uint ev = w & LANE_MASK;          // bytes 0 and 2
+-    uint od = (w >> 8u) & LANE_MASK;  // bytes 1 and 3
+-    [[unroll]] for (uint t = 0u; t < 5u; ++t) {
+-        const uint me = ev * 3u;
+-        const uint mo = od * 3u;
+-        const uint te = (me >> 8u) & TRIT_MASK;
+-        const uint to = (mo >> 8u) & TRIT_MASK;
+-        ev = me & LANE_MASK;
+-        od = mo & LANE_MASK;
+-        q[t] = vec4(float(te & 3u), float(to & 3u), float(te >> 16u), float(to >> 16u));
+-    }
+-}
+-
+-// Word 6: qh[0] and qh[1] hold four trits each and interleave into elements
+-// 120..127 (element 120 + 2*t + h).
+-void decode_qh(const uint w6, out vec4 qa, out vec4 qb) {
+-    uint x = (w6 & 0xFFu) | (((w6 >> 8u) & 0xFFu) << 16u);
+-    vec2 q[4];
+-    [[unroll]] for (uint t = 0u; t < 4u; ++t) {
+-        const uint m = x * 3u;
+-        const uint tr = (m >> 8u) & TRIT_MASK;
+-        x = m & LANE_MASK;
+-        q[t] = vec2(float(tr & 3u), float(tr >> 16u));
+-    }
+-    qa = vec4(q[0], q[1]);
+-    qb = vec4(q[2], q[3]);
+-}
+-
+-vec4 load_y4(const uint j, const uint b_offset, const uint e) {
+-    return vec4(data_b_v4[(j*p.batch_stride_b + b_offset + e) / 4u]);
+-}
++#define TEAM 32u
+ 
+ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+     uint a_offset, b_offset, d_offset;
+     get_offsets(a_offset, b_offset, d_offset);
+ 
+-    const uint num_blocks_per_row = p.ncols / QUANT_K;
++    const uint nb = p.ncols / QUANT_K;
+     const uint tid = gl_LocalInvocationID.x;
++    const uint l = tid % TEAM;
++    const uint team = tid / TEAM;
++    const uint nteams = max(BLOCK_SIZE / TEAM, 1u);
++
++    uint wofs;
++    uint shift;
++    uint ebase;
++    uint estride;
++    uint ntrit;
++    if (l < 16u) {
++        wofs = l >> 2u;                shift = 8u*(l & 3u);  ebase = l;                estride = 16u; ntrit = 5u;
++    } else if (l < 24u) {
++        wofs = 4u + ((l - 16u) >> 2u); shift = 8u*(l & 3u);  ebase = 80u + (l - 16u);  estride = 8u;  ntrit = 5u;
++    } else if (l < 26u) {
++        wofs = 6u;                     shift = 8u*(l - 24u); ebase = 120u + (l - 24u); estride = 2u;  ntrit = 4u;
++    } else {
++        wofs = 0u;                     shift = 0u;           ebase = 0u;               estride = 0u;  ntrit = 0u;
++    }
+ 
+     [[unroll]] for (uint j = 0u; j < NUM_COLS; ++j) {
+         [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+@@ -90,78 +58,64 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+         }
+     }
+ 
+-    const uint num_items = 2u * num_blocks_per_row;
+-    for (uint item = tid; item < num_items; item += BLOCK_SIZE) {
+-        const uint ib = item >> 1u;
+-        const uint h = item & 1u;
+-        const uint y_blk = ib * QUANT_K;
+-
+-        FLOAT_TYPE ysum[NUM_COLS];
+-        FLOAT_TYPE acc[NUM_COLS][NUM_ROWS];
++    for (uint ib = team; ib < nb; ib += nteams) {
++        // Activations of every column for this lane's five weights. The trits are
++        // decoded once per row pair and reused for all columns, so extra columns
++        // (speculative verification) only add their FMAs.
++        FLOAT_TYPE y[NUM_COLS][5];
++        FLOAT_TYPE ys[NUM_COLS];
+         [[unroll]] for (uint j = 0u; j < NUM_COLS; ++j) {
+-            ysum[j] = FLOAT_TYPE(0);
+-            [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+-                acc[j][n] = FLOAT_TYPE(0);
++            const uint yb = j*p.batch_stride_b + b_offset + ib*QUANT_K + ebase;
++            ys[j] = FLOAT_TYPE(0);
++            [[unroll]] for (uint t = 0u; t < 5u; ++t) {
++                const bool live = t < ntrit;
++                const FLOAT_TYPE v = FLOAT_TYPE(data_b[live ? yb + estride*t : yb]);
++                y[j][t] = live ? v : FLOAT_TYPE(0);
++                ys[j] += y[j][t];
+             }
+         }
+ 
+-        FLOAT_TYPE d[NUM_ROWS];
+-        [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
++        // Two rows at a time: their bytes sit in the two 16-bit halves of x, and
++        // 255*3 = 765 keeps each half's product inside its own half. After
++        // m = x*3 the trit of the low row is byte 1 of m and the trit of the high
++        // row is byte 3, which AMD converts to float in one instruction.
++        [[unroll]] for (uint n = 0u; n < NUM_ROWS; n += 2u) {
+             if (n < num_rows) {
+-                const uint wb = (a_offset + (first_row + n) * num_blocks_per_row + ib) * PTQ1_0_WORDS;
+-                d[n] = FLOAT_TYPE(unpackHalf2x16(data_a_u32[wb + 6u] >> 16u).x);
+-            }
+-        }
+-
+-        [[unroll]] for (uint kk = 0u; kk < 3u; ++kk) {
+-            const uint k = 3u*h + kk;
+-            vec4 q[NUM_ROWS][5];
+-            [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+-                if (n < num_rows) {
+-                    const uint wb = (a_offset + (first_row + n) * num_blocks_per_row + ib) * PTQ1_0_WORDS;
+-                    decode_word(data_a_u32[wb + k], q[n]);
++                const bool has1 = n + 1u < num_rows;
++                const uint wb0 = (a_offset + (first_row + n) * nb + ib) * PTQ1_0_WORDS;
++                const uint wb1 = has1 ? wb0 + nb * PTQ1_0_WORDS : wb0;
++                const uint w0 = data_a_u32[wb0 + wofs];
++                const uint w1 = data_a_u32[wb1 + wofs];
++                const FLOAT_TYPE d0 = FLOAT_TYPE(unpackHalf2x16(data_a_u32[wb0 + 6u] >> 16u).x);
++                const FLOAT_TYPE d1 = FLOAT_TYPE(unpackHalf2x16(data_a_u32[wb1 + 6u] >> 16u).x);
++
++                uint x = ((w0 >> shift) & 0xFFu) | (((w1 >> shift) & 0xFFu) << 16u);
++                FLOAT_TYPE acc0[NUM_COLS];
++                FLOAT_TYPE acc1[NUM_COLS];
++                [[unroll]] for (uint j = 0u; j < NUM_COLS; ++j) {
++                    acc0[j] = FLOAT_TYPE(0);
++                    acc1[j] = FLOAT_TYPE(0);
+                 }
+-            }
+-            [[unroll]] for (uint j = 0u; j < NUM_COLS; ++j) {
+                 [[unroll]] for (uint t = 0u; t < 5u; ++t) {
+-                    const vec4 yv = load_y4(j, b_offset, y_blk + word_base(k, t));
+-                    ysum[j] += FLOAT_TYPE(yv.x + yv.y + yv.z + yv.w);
+-                    [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+-                        if (n < num_rows) {
+-                            acc[j][n] += FLOAT_TYPE(dot(q[n][t], yv));
+-                        }
++                    const uint m = x * 3u;
++                    const FLOAT_TYPE tl = FLOAT_TYPE((m >> 8u) & 0xFFu);
++                    const FLOAT_TYPE th = FLOAT_TYPE(m >> 24u);
++                    [[unroll]] for (uint j = 0u; j < NUM_COLS; ++j) {
++                        acc0[j] = fma(tl, y[j][t], acc0[j]);
++                        acc1[j] = fma(th, y[j][t], acc1[j]);
+                     }
++                    x = m & 0x00FF00FFu;
+                 }
+-            }
+-        }
+ 
+-        if (h == 0u) {
+-            vec4 qh0[NUM_ROWS], qh1[NUM_ROWS];
+-            [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+-                if (n < num_rows) {
+-                    const uint wb = (a_offset + (first_row + n) * num_blocks_per_row + ib) * PTQ1_0_WORDS;
+-                    decode_qh(data_a_u32[wb + 6u], qh0[n], qh1[n]);
+-                }
+-            }
+-            [[unroll]] for (uint j = 0u; j < NUM_COLS; ++j) {
+-                const vec4 y0 = load_y4(j, b_offset, y_blk + 120u);
+-                const vec4 y1 = load_y4(j, b_offset, y_blk + 124u);
+-                ysum[j] += FLOAT_TYPE(y0.x + y0.y + y0.z + y0.w + y1.x + y1.y + y1.z + y1.w);
+-                [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+-                    if (n < num_rows) {
+-                        acc[j][n] += FLOAT_TYPE(dot(qh0[n], y0) + dot(qh1[n], y1));
++                const uint n1 = min(n + 1u, NUM_ROWS - 1u);
++                [[unroll]] for (uint j = 0u; j < NUM_COLS; ++j) {
++                    temp[j][n] = fma(d0, acc0[j] - ys[j], temp[j][n]);
++                    if (has1) {
++                        temp[j][n1] = fma(d1, acc1[j] - ys[j], temp[j][n1]);
+                     }
+                 }
+             }
+         }
+-
+-        [[unroll]] for (uint j = 0u; j < NUM_COLS; ++j) {
+-            [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+-                if (n < num_rows) {
+-                    temp[j][n] = fma(d[n], acc[j][n] - ysum[j], temp[j][n]);
+-                }
+-            }
+-        }
+     }
+ 
+     reduce_result(temp, d_offset, first_row, num_rows, tid);
+-- 
+2.45.2.windows.1
+
