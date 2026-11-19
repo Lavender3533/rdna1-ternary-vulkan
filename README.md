@@ -26,7 +26,7 @@ The stock kernel was measured with its original 2 rows per workgroup.
 
 | m × k | tokens (n) | stock | this repo | speedup |
 | --- | --- | --- | --- | --- |
-| 17408 × 5120 | 1 | 266 µs | 168 µs | 1.58× |
+| 17408 × 5120 | 1 | 266 µs | 168 µs | 1.59× |
 | 5120 × 17408 | 1 | 265 µs | 184 µs | 1.44× |
 | 4096 × 14336 | 1 | 169 µs | 132 µs | 1.28× |
 | 17408 × 5120 | 4 | 981 µs | 471 µs | 2.08× |
